@@ -16,5 +16,8 @@
     "https-proxy-agent": "^9.1.0",
     "playwright": "^1.62.1",
     "ws": "^8.21.1"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
   }
 }
