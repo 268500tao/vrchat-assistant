@@ -12,6 +12,7 @@ import path from 'node:path';
 import net from 'node:net';
 
 import { ctx, log, refreshWatchlistCache } from './core/server-context.js';
+import { initLogger, getLevelName } from './core/logger.js';
 import { recordOpsLog, setOpsLogSink } from './core/ops-log.js';
 import * as registry from './core/registry.js';
 import { isSafeModeEnabled, DESTRUCTIVE_TOOLS } from './core/safe-mode.js';
@@ -78,6 +79,10 @@ const BACKUP_DIR = process.env.VRC_MONITOR_BACKUP_DIR
 const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 每 24h 自动备份
 
 Object.assign(ctx.paths, { __dirname, PORT, HOST, COOKIE_FILE, CRED_FILE, DB_PATH, BACKUP_DIR, BACKUP_INTERVAL_MS });
+
+// ── 日志配置 → 写入 ctx.paths（供其他模块/插件查询）──
+// LOG_DIR/LOG_LEVEL/LOG_FORMAT 由 logger 自行从 env 解析，这里只在 main() 初始化后回填可读值
+// 见 main() 顶部 initLogger() 逻辑
 
 // ── WebSocket 事件 → 好友状态更新 ──
 async function _updateFriendState(event) {
@@ -222,8 +227,12 @@ async function _syncFriendAvatars() {
         const tl = f.trustLevel || inferTrustFromTags(f.tags);
         if (!av && !ic && !tl) continue;
         const ex = storage.getFriend(f.id);
-        if (ex && (ex.avatar_image_url || ex.user_icon) && ex.trust_level) continue; // 头像+信任等级都有则不覆盖
-        storage.upsertFriend({ userId: f.id, avatarImageUrl: av, userIcon: ic, trustLevel: tl });
+        // issue #127 补漏：好友列表 API 响应带 f.displayName，但此前 upsert 未传 displayName，
+        // 离线好友（无 WS 事件带名字）的 display_name 永远为空 → 前端显示 '?'。故：
+        // ① 跳过条件要求 display_name 也已填（否则名字空的好友被 continue 漏掉）；
+        // ② upsert 补传 displayName，下次头像同步即回填离线好友名字。
+        if (ex && (ex.avatar_image_url || ex.user_icon) && ex.trust_level && ex.display_name) continue; // 头像+信任等级+display_name 都有则不覆盖
+        storage.upsertFriend({ userId: f.id, displayName: f.displayName, avatarImageUrl: av, userIcon: ic, trustLevel: tl });
         updated++;
       }
       offset += r.data.length;
@@ -590,9 +599,16 @@ async function main() {
   try {
     APP_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8')).version;
   } catch { /* 读不到则显示 unknown，不阻断启动 */ }
-  console.log('══════════════════════════════════════════════');
-  console.log(`  VRChat-Assistant v${APP_VERSION}`);
-  console.log('══════════════════════════════════════════════\n');
+
+  // 0. 初始化日志（必须在任何业务输出之前；logger 从 env 自读全部 VRC_MONITOR_LOG_*）
+  //    返回的 state 含 dir/level/format，回写 ctx.paths 供其他模块/插件查询
+  const logState = initLogger();
+  Object.assign(ctx.paths, { LOG_DIR: logState.dir, LOG_LEVEL: getLevelName(logState.level), LOG_FORMAT: logState.format });
+
+  log('══════════════════════════════════════════════');
+  log(`  VRChat-Assistant v${APP_VERSION}`);
+  log(`  LOG_DIR=${ctx.paths.LOG_DIR} | LOG_LEVEL=${ctx.paths.LOG_LEVEL} | LOG_FORMAT=${ctx.paths.LOG_FORMAT}`);
+  log('══════════════════════════════════════════════\n');
 
   // 0. 端口预检：MCP 端口已被占用 → 立即退出（防双实例并存 → OTP 验证码互抢循环，issue #49）
   //    必须前置：认证+OTP 抓取/WebSocket 在 main() 靠后位置，若等 listen 阶段才发现端口冲突，

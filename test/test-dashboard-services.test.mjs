@@ -19,6 +19,7 @@ const REPO = path.join(__dirname, '..');
 const { ctx } = await import(pathToFileURL(path.join(REPO, 'core', 'server-context.js')).href);
 const { Storage } = await import(pathToFileURL(path.join(REPO, 'core', 'storage.js')).href);
 const { registerDashboardServices } = await import(pathToFileURL(path.join(REPO, 'core', 'dashboard-services.js')).href);
+const { avatarFileId } = await import(pathToFileURL(path.join(REPO, 'core', 'img-util.js')).href);
 
 // ── 临时 DB + 运行时准备 ──
 const tmpDb = path.join(__dirname, 'test-dash-services.sqlite3');
@@ -69,6 +70,18 @@ test('dashboard.trackedNonFriends 返回 tracked 列表形状', () => {
   assert.ok(r.tracked.some((x) => x.userId === UID && x.displayName === '测试用户'));
 });
 
+test('trackedNonFriends.lastChangeAt 与 trackedChanges 最新变化一致（真实变更时间，非检测时间）', () => {
+  const list = services.get('dashboard.trackedNonFriends')({ limit: 10 }).tracked;
+  const x = list.find((i) => i.userId === UID);
+  assert.ok(x, '应能找到测试用户');
+  const cs = services.get('dashboard.trackedChanges')({ userId: UID, limit: 5 }).changes;
+  assert.ok(cs.length >= 2, '应有变化记录');
+  // lastChangeAt 应等于变化时间线最新一条 createdAt（ISO 带 Z）
+  assert.equal(x.lastChangeAt, cs[0].createdAt);
+  // lastRefreshAt 是检测时间(SQLite 无时区 UTC 串),与 lastChangeAt 语义不同
+  assert.ok(x.lastRefreshAt && x.lastRefreshAt !== x.lastChangeAt);
+});
+
 test('dashboard.trackedChanges 返回 bio/status 变化（含前后值）', () => {
   const r = services.get('dashboard.trackedChanges')({ userId: UID, limit: 10 });
   assert.ok(Array.isArray(r.changes));
@@ -92,7 +105,11 @@ test('dashboard.trackedChanges 返回 avatar 变化形状（前后缩略图字�
   const r = services.get('dashboard.trackedChanges')({ userId: UID, limit: 20 });
   const av = r.changes.find((c) => c.type === 'avatar');
   assert.ok(av);
-  assert.ok(av.avatarImageUrl.includes('/image/'), '头像应缩略图化');
+  // #122 抽出 img-util 后 avatarThumb 经 imgProxy 改写为 /api/dashboard/image-proxy?url=...，
+  // url 参数内的 /image/ 被百分比编码(%2Fimage%2F)，字面量 includes('/image/') 不再成立；
+  // 正确断言：已是代理 URL 且解码后含 /image/（证明确实缩略图化）
+  assert.ok(av.avatarImageUrl.startsWith('/api/dashboard/image-proxy?url='), '头像应走本地图片代理');
+  assert.ok(decodeURIComponent(av.avatarImageUrl).includes('/image/'), '头像应缩略图化');
   assert.ok(av.previousAvatarImageUrl);
 });
 
@@ -234,6 +251,91 @@ test('dashboard.groupAnnouncementsAll 汇总跨群组公告', () => {
   const ts = r.announcements.map((a) => a.createdAt);
   const sorted = [...ts].sort().reverse();
   assert.deepEqual(ts, sorted, '公告按时间降序');
+});
+
+test('avatarFileId 从代理/原始 URL 提取 file id（#122 imgProxy 回归）', () => {
+  const raw = 'https://api.vrchat.cloud/api/1/file/file_de43c23b-8efa-4f4c-acb0-8c0c2dad9817/1/file';
+  const proxied = '/api/dashboard/image-proxy?url=' + encodeURIComponent(raw);
+  // 代理 URL 里的 /file/ 被编码成 %2Ffile%2F，直接正则失配；avatarFileId 先还原再匹配
+  assert.equal(avatarFileId(proxied), 'file_de43c23b-8efa-4f4c-acb0-8c0c2dad9817');
+  assert.equal(avatarFileId(raw), 'file_de43c23b-8efa-4f4c-acb0-8c0c2dad9817');
+  assert.equal(avatarFileId(''), null);
+  assert.equal(avatarFileId(null), null);
+  assert.equal(avatarFileId('https://example.com/no-file-here'), null);
+});
+// ── avatar 缩略图推导：WS 推送的 avatar 事件有时只带 avatarImageUrl（原图）不带
+// avatarThumbnailUrl（缩略图）→ 后端应从 avatarImageUrl 推导缩略图（/file → /image/1/256），
+// 否则前端只显示模型名不显示模型图（用户反馈）
+test('dashboard.events avatar 事件缺缩略图时从 avatarImageUrl 推导', async () => {
+  const AUID = 'usr_test-0000-0000-0000-0000000000b1';
+  const fid = 'file_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const avatarUrl = 'https://api.vrchat.cloud/api/1/file/' + fid + '/1/file';
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: AUID, displayName: '缩略图用户',
+    contentJson: {
+      userId: AUID, displayName: '缩略图用户', type: 'avatar',
+      avatarName: '测试模型',
+      avatarImageUrl: avatarUrl,
+      previousAvatarImageUrl: 'https://api.vrchat.cloud/api/1/file/file_bbbbbbbb-0000-0000-0000-000000000000/1/file',
+    },
+    worldId: '', worldName: '', createdAt: new Date().toISOString(), source: 'ws',
+  });
+  const r = await services.get('dashboard.events')({ limit: 50, offset: 0 });
+  const ev = r.events.find((e) => e.userId === AUID);
+  assert.ok(ev, '应能查到 avatar 事件');
+  assert.equal(ev.updateType, 'avatar');
+  assert.equal(ev.avatarName, '测试模型', '模型名应保留');
+  assert.ok(ev.avatarThumbnailUrl, 'avatarThumbnailUrl 不应为空');
+  // 缩略图经 imgProxy 代理（URL 被编码），decodeURIComponent 还原后应是推导的 image/{fid}/1/256
+  const decodedThumb = decodeURIComponent(ev.avatarThumbnailUrl);
+  assert.ok(
+    decodedThumb.includes('/image/') && decodedThumb.includes('/1/256'),
+    '缩略图应为推导的 image/{fid}/1/256，实际: ' + ev.avatarThumbnailUrl
+  );
+  assert.ok(decodedThumb.includes(fid), '缩略图应含同一 file id，实际: ' + ev.avatarThumbnailUrl);
+});
+
+// 审核建议补充：WS 推送**带** avatarThumbnailUrl 时，返回的也必须是 imgProxy 代理形式
+// （否则正常事件直连 CDN 裸 URL，国内加载失败/变慢，恰好复现"图不显示"）
+test('dashboard.events avatar 事件带缩略图时仍走 imgProxy 代理', async () => {
+  const PUID = 'usr_test-0000-0000-0000-0000000000c1';
+  const rawThumb = 'https://api.vrchat.cloud/api/1/image/file_cccccccc-0000-0000-0000-000000000000/1/256';
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: PUID, displayName: '代理用户',
+    contentJson: {
+      userId: PUID, displayName: '代理用户', type: 'avatar',
+      avatarName: '带图模型',
+      avatarImageUrl: 'https://api.vrchat.cloud/api/1/file/file_cccccccc-0000-0000-0000-000000000000/1/file',
+      avatarThumbnailUrl: rawThumb,
+    },
+    worldId: '', worldName: '', createdAt: new Date().toISOString(), source: 'ws',
+  });
+  const r = await services.get('dashboard.events')({ limit: 50, offset: 0 });
+  const ev = r.events.find((e) => e.userId === PUID);
+  assert.ok(ev, '应能查到 avatar 事件');
+  // 必须带 imgProxy 前缀（走本地图片代理），不允许裸 CDN URL
+  assert.ok(
+    ev.avatarThumbnailUrl.startsWith('/api/dashboard/image-proxy?url='),
+    '带缩略图事件也应走 imgProxy 代理，实际: ' + ev.avatarThumbnailUrl
+  );
+  // 解码后仍是原缩略图
+  const decoded = decodeURIComponent(ev.avatarThumbnailUrl.split('?url=')[1]);
+  assert.equal(decoded, rawThumb, '解码后应为原始缩略图 URL');
+});
+
+// ── issue #127 Bug2：upsertFriend 空串不覆盖已有 display_name ──
+// offline/空 payload 事件会以 '' 覆盖已存名字，导致离线好友显示 '?'
+test('upsertFriend 空串不覆盖已有 display_name', () => {
+  const FID = 'usr_test-0000-0000-0000-0000000000e1';
+  ctx.storage.upsertFriend({ userId: FID, displayName: '真实名字', isOnline: 1 });
+  // 再 upsert 一个空 displayName 的事件（模拟 offline/缺名 payload）→ 不应清空名字
+  ctx.storage.upsertFriend({ userId: FID, displayName: '', isOnline: 0 });
+  const row = ctx.storage.query(`SELECT display_name AS dn FROM friends WHERE user_id=$u`, { $u: FID })[0];
+  assert.equal(row.dn, '真实名字', '空 displayName 不应覆盖已有名字，实际: ' + row.dn);
+  // 非空名字正常更新
+  ctx.storage.upsertFriend({ userId: FID, displayName: '新名字', isOnline: 1 });
+  const row2 = ctx.storage.query(`SELECT display_name AS dn FROM friends WHERE user_id=$u`, { $u: FID })[0];
+  assert.equal(row2.dn, '新名字', '非空 displayName 应正常更新');
 });
 
 // ── 清理 ──

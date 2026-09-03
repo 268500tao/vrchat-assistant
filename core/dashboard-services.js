@@ -10,7 +10,35 @@
  * 纯搬移重构：服务名、owner、实现逐字节一致，无行为变更。
  */
 import { isSafeModeEnabled } from './safe-mode.js';
-import { imgProxy, avatarThumb, avatarOf } from './img-util.js';
+import { imgProxy, avatarThumb, avatarOf, avatarFileId } from './img-util.js';
+
+// 通知类型→中文标签（与前端 ui/src/utils.js 的 notificationTypeLabels 对齐，供 see/hide-notification 摘要拼类型）。
+// 通知相关事件 content 可能携带 notificationType / updateType / type 之一；历史遗留也可能是裸字符串 ID，
+// 取不到类型时返回 ''，摘要回退为固定标签。见 T2：通知已读/已隐藏摘要需写清楚通知类型。
+function notificationTypeLabel(content) {
+  const c = (content && typeof content === 'object') ? content : {};
+  const t = c.notificationType || c.updateType || c.type || '';
+  if (!t) return '';
+  const label = {
+    friendRequest: '好友请求',
+    invite: '房间邀请',
+    requestInvite: '请求加入',
+    requestInviteResponse: '加入响应',
+    friendRequestResponse: '好友响应',
+    giftSub: '订阅礼物',
+    votetokick: '投票踢人',
+    groupInvite: '群组邀请',
+    groupJoinRequest: '群组加入请求',
+    groupAnnouncement: '群公告',
+    'group.event.started': '群活动开始',
+    'group.event.ended': '群活动结束',
+    'group.event.scheduled': '群活动计划',
+    moderationWarning: '警告',
+    message: '消息',
+    group: '群组',
+  }[t];
+  return label || '';
+}
 
 // 自己 userId 的权威推导：user-location/user-update 事件只会是自己的（事件管线保证），
 // 种子导入/列表展示用它排除自己（/auth/user 在启动早期可能失败或缓存未就绪）
@@ -63,7 +91,10 @@ export function registerDashboardServices(loader, ctx) {
       f.last_seen AS lastSeen, f.last_online AS lastOnline, f.last_offline AS lastOffline
       FROM friends f LEFT JOIN world_cache wc ON wc.world_id = f.world_id
       ORDER BY f.is_online DESC, f.display_name COLLATE NOCASE LIMIT $limit`,
-    { $limit: Math.min(Math.max(Number(limit) || 100, 1), 200) });
+    // issue #127：limit 上限提高到 1000，好友列表全量进 store.friends——
+    // 「最近一起玩」按历史同屏聚合（与在线状态无关），排序靠后的好友此前被前 100/200 截断
+    // → 点开误判「非好友」，共同好友/群组/世界/模型信息丢失。
+    { $limit: Math.min(Math.max(Number(limit) || 100, 1), 1000) });
     // 后台预热：在线好友所在世界缺缓存时拉取填充 world_cache（限流+10s 超时，不阻塞响应；
     // 填充后下次请求 worldName/worldImageUrl 即有值，右侧栏显示世界名+头图）
     try {
@@ -283,9 +314,11 @@ export function registerDashboardServices(loader, ctx) {
       const location = content.location || '';
       const locInfo = parseLocInfo(location);
       const prev = (row.type === 'friend-location' || row.type === 'user-location') ? previousLocationOf(row.user_id, row.id) : null;
-      // 群组名解析（缓存优先）：group-joined/group-member-updated 只有 groupId；
+      // 群组名解析（缓存优先）：group-joined/group-member-updated 平铺 groupId；
+      // group-role-updated 的 content 是嵌套 {role:{groupId,name,permissions}} → 回退 role.groupId（字段错位 T4）
       // 未命中的丢后台限流拉 /groups/{id} 回填 group_cache，下次请求即有群名
-      const gName = content.groupId ? (((ctx.storage.getGroupCached(content.groupId) || {}).name) || '') : '';
+      const gidForGName = content.groupId || (content.role && content.role.groupId) || '';
+      const gName = gidForGName ? (((ctx.storage.getGroupCached(gidForGName) || {}).name) || '') : '';
       // 通知更新事件（notification-v2-update/notification-update）只有 {id, updates}：
       // content.id 指向被更新的原通知（user_id），关联回原通知取群组信息与内容
       let src = content;
@@ -316,7 +349,10 @@ export function registerDashboardServices(loader, ctx) {
         notiTitle: src.title || '',
         notiGroupName: ((src.data && src.data.groupName) || gName || (src.title ? String(src.title).split(':')[0].trim() : '') || ''),
         notiGroupId: ((src.data && src.data.groupId) || ''),
-        groupId: content.groupId || '',
+        groupId: content.groupId || (content.role && content.role.groupId) || '',
+        // group-role-updated 角色详情（content.role 嵌套；字段错位 T4）供前端详单
+        roleName: (content.role && content.role.name) || '',
+        rolePermissions: Array.isArray(content.role && content.role.permissions) ? content.role.permissions : [],
         contentActionType: content.actionType || '',
         reconcile: !!content.reconcile,
         lastSeenAt: content.lastSeen || '',
@@ -343,8 +379,9 @@ export function registerDashboardServices(loader, ctx) {
           : row.type === 'content-refresh' ? ('内容库：' + (content.actionType === 'add' ? '获得' : content.actionType === 'delete' ? '移除' : content.actionType || '更新') + ({ prop: '道具', bundle: '捆绑包', accessory: '配件', shared: '共享物品' }[content.itemType] || content.itemType || '物品'))
           : row.type === 'group-joined' ? ('加入群组' + (gName ? '：' + gName : ''))
           : row.type === 'group-member-updated' ? ('群组成员信息更新' + (gName ? '：' + gName : ''))
-          : row.type === 'hide-notification' ? '通知已隐藏'
-          : row.type === 'see-notification' ? '通知已读'
+          : row.type === 'group-role-updated' ? ('群组角色更新' + (gName ? '：' + gName : '') + ((content.role && content.role.name) ? '（角色：' + content.role.name + '）' : ''))
+          : row.type === 'hide-notification' ? ('通知已隐藏' + (notificationTypeLabel(content) ? '：' + notificationTypeLabel(content) : ''))
+          : row.type === 'see-notification' ? ('通知已读' + (notificationTypeLabel(content) ? '：' + notificationTypeLabel(content) : ''))
           : row.type === 'unknown' ? '未知事件'
           : '未分类事件: ' + row.type,
         // 对齐 VRCX Feed detail：各类型的具体字段
@@ -366,7 +403,7 @@ export function registerDashboardServices(loader, ctx) {
           return '';
         })(),
         avatarImageUrl: imgProxy(content.avatarImageUrl || user.currentAvatarImageUrl || ''),
-        avatarThumbnailUrl: imgProxy(content.avatarThumbnailUrl || user.currentAvatarThumbnailImageUrl || ''),
+        avatarThumbnailUrl: imgProxy(content.avatarThumbnailUrl || user.currentAvatarThumbnailImageUrl || (content.avatarImageUrl ? avatarThumb(content.avatarImageUrl) : '')),
         avatarTags: Array.isArray(content.avatarTags) ? content.avatarTags : (Array.isArray(user.currentAvatarTags) ? user.currentAvatarTags : []),
         previousAvatarImageUrl: imgProxy(content.previousAvatarImageUrl || ''),
         bio: content.bio || user.bio || '',
@@ -412,7 +449,7 @@ export function registerDashboardServices(loader, ctx) {
     };
     // 群组名后台补全（限流）：缓存未命中的群组事件拉 /groups/{id} 回填 group_cache，本次响应立即返回
     const needGroup = [...new Set(result
-      .filter((e) => (e.type === 'group-joined' || e.type === 'group-member-updated') && e.groupId && !e.notiGroupName)
+      .filter((e) => (e.type === 'group-joined' || e.type === 'group-member-updated' || e.type === 'group-role-updated') && e.groupId && !e.notiGroupName)
       .map((e) => e.groupId))].slice(0, 5);
     if (needGroup.length) {
       (async () => {
@@ -452,17 +489,21 @@ export function registerDashboardServices(loader, ctx) {
     const needName = result.filter((e) => e.updateType === 'avatar');
     const pending = [];
     const seen = new Set();
-    // 收集需要解析的模型名：新模型（avatarName）+ 旧模型（previousAvatarName），按 fileId 去重
-    for (const ev of needName.slice(0, 10)) {
+    // 收集需要解析的模型名：新模型（avatarName）+ 旧模型（previousAvatarName），按 fileId 去重。
+    // 扫描全部 avatar 事件（不只 slice(0,10)）：正则匹配是纯内存操作，pending 上限 6 已限流；
+    // 若只扫最新 10 条，回归期间积累的历史 avatar 事件永远轮不到补名（实测 14 条一直"未知模型"）。
+    for (const ev of needName) {
       const jobs = [
         { url: ev.avatarImageUrl, key: 'avatarName' },
         { url: ev.previousAvatarImageUrl, key: 'previousAvatarName' },
       ];
       for (const j of jobs) {
         if (!j.url) continue;
-        const fm = String(j.url).match(/\/file\/(file_[a-f0-9-]+)/);
-        if (!fm) continue;
-        const fileId = fm[1];
+        // j.url 已过 imgProxy 代理（/api/dashboard/image-proxy?url=<encodeURIComponent(原URL)>），
+        // 原 URL 里的 /file/ 被编码成 %2Ffile%2F，直接 match 必然失败（#122 引入 img-util 后回归，
+        // 导致模型名全部显示"未知模型"）。avatarFileId 会先还原代理 URL 再提取 fileId。
+        const fileId = avatarFileId(j.url);
+        if (!fileId) continue;
         if (anCache.has(fileId)) { ev[j.key] = anCache.get(fileId); continue; }
         if (seen.has(fileId)) continue;
         seen.add(fileId);
@@ -522,7 +563,7 @@ export function registerDashboardServices(loader, ctx) {
         worldId: row.world_id || content.worldId || world.id || '',
         worldName: row.world_name || world.name || '',
         avatarUrl: avatarOf(friend?.userIcon, friend?.avatarUrl),
-        summary: row.type === 'friend-location' ? '位置变化' : row.type === 'friend-online' ? '上线' : row.type === 'friend-offline' ? '离线' : row.type === 'friend-active' ? '状态变化' : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'notification' || row.type === 'notification-v2' ? (content.message || content.title || '通知') : row.type === 'notification-v2-update' || row.type === 'notification-update' ? (content.updates && content.updates.seen ? '通知已读' : '通知状态更新') : row.type === 'user-update' ? ({ status: '状态变化', bio: '简介变化', avatar: '更换模型', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'user-location' ? '我的位置变化' : row.type === 'friend-add' ? '新增好友' : row.type === 'friend-delete' ? '已解除好友' : row.type === 'content-refresh' ? ('内容库：' + (content.actionType === 'add' ? '获得' : content.actionType === 'delete' ? '移除' : content.actionType || '更新') + ({ prop: '道具', bundle: '捆绑包' }[content.itemType] || content.itemType || '物品')) : row.type === 'group-joined' ? '加入群组' : row.type === 'group-member-updated' ? '群组成员信息更新' : row.type === 'hide-notification' ? '通知已隐藏' : row.type === 'see-notification' ? '通知已读' : row.type === 'unknown' ? '未知事件' : '未分类事件: ' + row.type,
+        summary: row.type === 'friend-location' ? '位置变化' : row.type === 'friend-online' ? '上线' : row.type === 'friend-offline' ? '离线' : row.type === 'friend-active' ? '状态变化' : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'notification' || row.type === 'notification-v2' ? (content.message || content.title || '通知') : row.type === 'notification-v2-update' || row.type === 'notification-update' ? (content.updates && content.updates.seen ? '通知已读' : '通知状态更新') : row.type === 'user-update' ? ({ status: '状态变化', bio: '简介变化', avatar: '更换模型', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'user-location' ? '我的位置变化' : row.type === 'friend-add' ? '新增好友' : row.type === 'friend-delete' ? '已解除好友' : row.type === 'content-refresh' ? ('内容库：' + (content.actionType === 'add' ? '获得' : content.actionType === 'delete' ? '移除' : content.actionType || '更新') + ({ prop: '道具', bundle: '捆绑包' }[content.itemType] || content.itemType || '物品')) : row.type === 'group-joined' ? '加入群组' : row.type === 'group-member-updated' ? '群组成员信息更新' : row.type === 'group-role-updated' ? '群组角色更新' : row.type === 'hide-notification' ? ('通知已隐藏' + (notificationTypeLabel(content) ? '：' + notificationTypeLabel(content) : '')) : row.type === 'see-notification' ? ('通知已读' + (notificationTypeLabel(content) ? '：' + notificationTypeLabel(content) : '')) : row.type === 'unknown' ? '未知事件' : '未分类事件: ' + row.type,
       };
     });
   });
@@ -667,10 +708,13 @@ export function registerDashboardServices(loader, ctx) {
   loader.services.set('dashboard.trackedNonFriends', ({ limit = 200 } = {}) => {
     try {
       const rows = ctx.storage.query(
-        `SELECT user_id AS userId, display_name AS displayName, avatar_image_url AS avatarUrl,
-                status, status_description AS statusDescription, location,
-                added_at AS addedAt, last_refresh_at AS lastRefreshAt
-         FROM tracked_non_friends WHERE removed_at = '' ORDER BY last_refresh_at DESC, added_at DESC LIMIT $limit`,
+        `SELECT t.user_id AS userId, t.display_name AS displayName, t.avatar_image_url AS avatarUrl,
+                t.status, t.status_description AS statusDescription, t.location,
+                t.added_at AS addedAt, t.last_refresh_at AS lastRefreshAt,
+                (SELECT e.created_at FROM events e
+                  WHERE e.user_id = t.user_id AND e.type = 'friend-update' AND e.source = 'poll'
+                  ORDER BY e.id DESC LIMIT 1) AS lastChangeAt
+         FROM tracked_non_friends t WHERE t.removed_at = '' ORDER BY t.last_refresh_at DESC, t.added_at DESC LIMIT $limit`,
         { $limit: Math.min(Math.max(Number(limit) || 200, 1), 500) });
       const selfId = getSelfUserId(ctx.storage);
       return { tracked: rows.filter((r) => r.userId !== selfId).map((r) => ({ ...r, avatarUrl: avatarThumb(r.avatarUrl) || '' })) };
