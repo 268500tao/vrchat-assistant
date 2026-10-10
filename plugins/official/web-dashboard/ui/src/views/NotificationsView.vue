@@ -14,6 +14,24 @@ const loading = ref(false);
 const acting = ref(new Set());
 const kindSel = ref('all');
 const onlyUnseen = ref(false);   // 只看未读
+// 消息折叠：默认截断 2 行，点击展开/收起（通知消息可能很长，全部展开占屏）
+const msgExpanded = ref(new Set());
+function toggleMsg(x) {
+  const id = x.id || x.eventId;
+  if (msgExpanded.value.has(id)) msgExpanded.value.delete(id);
+  else msgExpanded.value.add(id);
+}
+function isMsgExpanded(x) { return msgExpanded.value.has(x.id || x.eventId); }
+// 通知图片（封面/活动图）点击页内放大预览（lightbox），关闭按钮/点遮罩退出
+const previewImg = ref('');
+function openImage(src) {
+  if (src) previewImg.value = src;
+}
+function closePreview() { previewImg.value = ''; }
+// 群组通知：senderUserId 为 grp_ 或类型以 group. 开头，头像区显示群封面图（imageUrl）
+function isGroupNotif(x) {
+  return String(x.senderUserId || '').startsWith('grp_') || String(x.type || x.notificationType || '').startsWith('group.');
+}
 
 const KINDS = [
   { v: 'all', l: '全部' },
@@ -108,7 +126,7 @@ async function act(x, action) {
 
 function friendAvatarOf(userId) {
   const f = (store.friends || []).find(fr => fr.userId === userId);
-  return (f && (f.avatarUrl || f.userIcon)) || '';
+  return (f && (f.userIcon || f.avatarUrl)) || '';
 }
 function nameOf(x) {
   const f = (store.friends || []).find(fr => fr.userId === (x.senderUserId || x.userId));
@@ -136,7 +154,7 @@ onUnmounted(() => clearInterval(timer));
     <div class="nt-head">
       <h2><i class="pi pi-bell"></i> 通知</h2>
       <span class="nt-count">当前 {{ currentShown.length }} · 历史 {{ historyShown.length }}</span>
-      <Button size="small" icon="pi pi-check-double" :loading="seeingAll" label="全部已读" title="标记当前未读通知为已读（最多 15 条）" @click="markAllSeen" />
+      <Button size="small" icon="pi pi-check" :loading="seeingAll" label="全部已读" title="标记当前未读通知为已读（最多 15 条）" @click="markAllSeen" />
       <Button size="small" text icon="pi pi-refresh" title="刷新" @click="reload" />
     </div>
 
@@ -155,15 +173,16 @@ onUnmounted(() => clearInterval(timer));
       <div v-else class="nt-list">
         <div v-for="x in currentShown" :key="x.id" class="nt-row" :class="{ unseen: !x.seen }">
         <span v-if="!x.seen" class="nt-dot" aria-hidden="true"></span>
-          <img v-if="friendAvatarOf(x.senderUserId) || x.imageUrl" class="nt-av" :src="friendAvatarOf(x.senderUserId) || x.imageUrl" alt="" loading="lazy" />
-          <div v-else class="nt-av nt-av-empty">{{ avatarLabel('', nameOf(x)) }}</div>
+          <img v-if="(x.isGroup ? (x.groupImageUrl || x.imageUrl) : friendAvatarOf(x.senderUserId))" class="nt-av" :src="(x.isGroup ? (x.groupImageUrl || x.imageUrl) : friendAvatarOf(x.senderUserId))" alt="" loading="lazy" />
+          <div v-else class="nt-av nt-av-empty">{{ avatarLabel('', x.groupName || nameOf(x)) }}</div>
           <div class="nt-body">
             <div class="nt-top">
-              <b class="nt-name" :style="{ color: trustColor((store.friends || []).find(fr => fr.userId === x.senderUserId)?.trustLevel) }" @click="x.senderUserId?.startsWith('usr_') && openUser({ userId: x.senderUserId, displayName: nameOf(x) })" role="button" tabindex="0" @keydown.enter="x.senderUserId?.startsWith('usr_') && openUser({ userId: x.senderUserId, displayName: nameOf(x) })">{{ nameOf(x) }}</b>
+              <b class="nt-name" :style="{ color: trustColor((store.friends || []).find(fr => fr.userId === x.senderUserId)?.trustLevel) }" @click="x.senderUserId?.startsWith('usr_') && openUser({ userId: x.senderUserId, displayName: nameOf(x) })" role="button" tabindex="0" @keydown.enter="x.senderUserId?.startsWith('usr_') && openUser({ userId: x.senderUserId, displayName: nameOf(x) })">{{ x.groupName || nameOf(x) }}</b>
               <span class="nt-type"><i class="pi nt-ico" :class="typeIcon(x)"></i>{{ typeLabel(x) }}</span>
               <span class="nt-time mono" :title="date(x.created_at)">{{ time(x.created_at) }}</span>
             </div>
-            <div class="nt-msg">{{ x.message || x.details || typeLabel(x) }}</div>
+            <div class="nt-msg" :class="{ 'nt-msg-clamp': !isMsgExpanded(x) }" :title="!isMsgExpanded(x) ? (x.message || x.details || '') : ''" @click="toggleMsg(x)" role="button" tabindex="0" @keydown.enter="toggleMsg(x)">{{ x.message || x.details || typeLabel(x) }}</div>
+            <img v-if="x.imageUrl && !isGroupNotif(x)" class="nt-img" :src="x.imageUrl" alt="" loading="lazy" title="点击查看原图" @click="openImage(x.imageUrl)" role="button" tabindex="0" @keydown.enter="openImage(x.imageUrl)" />
           </div>
           <div class="nt-acts">
             <template v-if="kindOf(x) === 'friendRequest'">
@@ -183,19 +202,28 @@ onUnmounted(() => clearInterval(timer));
       <div v-if="!historyShown.length" class="empty" style="padding:14px">暂无历史通知</div>
       <div v-else class="nt-list">
         <div v-for="x in historyShown" :key="x.eventId" class="nt-row nt-ro">
-          <div v-if="x.senderUsername" class="nt-av nt-av-empty">{{ avatarLabel('', x.senderUsername) }}</div>
-          <div v-else class="nt-av nt-av-empty">{{ avatarLabel('', '?') }}</div>
+          <img v-if="isGroupNotif(x) && x.imageUrl" class="nt-av" :src="x.imageUrl" alt="" loading="lazy" />
+          <img v-else-if="friendAvatarOf(x.senderUserId)" class="nt-av" :src="friendAvatarOf(x.senderUserId)" alt="" loading="lazy" />
+          <div v-else class="nt-av nt-av-empty">{{ avatarLabel('', x.groupName || x.senderUsername || '?') }}</div>
           <div class="nt-body">
             <div class="nt-top">
-              <b class="nt-name">{{ x.senderUsername || '系统' }}</b>
+              <b class="nt-name" :style="{ color: trustColor((store.friends || []).find(fr => fr.userId === x.senderUserId)?.trustLevel) }" @click="x.senderUserId?.startsWith('usr_') && openUser({ userId: x.senderUserId, displayName: x.senderUsername || x.groupName || '' })" role="button" tabindex="0" @keydown.enter="x.senderUserId?.startsWith('usr_') && openUser({ userId: x.senderUserId, displayName: x.senderUsername || x.groupName || '' })">{{ x.groupName || x.senderUsername || '系统' }}</b>
               <span class="nt-type"><i class="pi nt-ico" :class="typeIcon(x)"></i>{{ typeLabel(x) }}</span>
               <span class="nt-time mono" :title="date(x.createdAt)">{{ time(x.createdAt) }}<small>{{ date(x.createdAt) }}</small></span>
             </div>
-            <div class="nt-msg">{{ x.message || x.title || typeLabel(x) }}</div>
+            <div class="nt-msg" :class="{ 'nt-msg-clamp': !isMsgExpanded(x) }" :title="!isMsgExpanded(x) ? (x.message || x.title || '') : ''" @click="toggleMsg(x)" role="button" tabindex="0" @keydown.enter="toggleMsg(x)">{{ x.message || x.title || typeLabel(x) }}</div>
+            <img v-if="x.imageUrl && !isGroupNotif(x)" class="nt-img" :src="x.imageUrl" alt="" loading="lazy" title="点击查看原图" @click="openImage(x.imageUrl)" role="button" tabindex="0" @keydown.enter="openImage(x.imageUrl)" />
           </div>
         </div>
       </div>
     </template>
+
+    <!-- 图片放大预览（lightbox） -->
+    <div v-if="previewImg" class="nt-preview" @click.self="closePreview" role="dialog" aria-modal="true" aria-label="图片预览">
+      <img :src="previewImg" class="nt-preview-img" alt="通知图片预览" @click.self="closePreview" />
+      <Button icon="pi pi-times" rounded text class="nt-preview-close" aria-label="关闭预览" @click="closePreview" />
+      <a class="nt-preview-open" :href="previewImg" target="_blank" rel="noopener">新标签打开</a>
+    </div>
   </div>
 </template>
 
@@ -226,6 +254,15 @@ onUnmounted(() => clearInterval(timer));
 .nt-time { font-size: 10px; color: var(--text-dim); margin-left: auto; flex: none; font-family: var(--font-mono, monospace); }
 .nt-time small { margin-left: 4px; }
 .nt-msg { font-size: 11.5px; color: var(--text-dim); margin-top: 3px; overflow-wrap: anywhere; }
+.nt-msg-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
+/* 通知图片（封面/活动图）：消息下方大图展示，点击新标签看原图；头像区仍用 nt-av 小圆 */
+.nt-img { display: block; max-width: 100%; max-height: 220px; border-radius: 8px; margin-top: 7px; object-fit: contain; cursor: zoom-in; border: 1px solid var(--border-soft); }
+/* 图片放大预览遮罩 */
+.nt-preview { position: fixed; inset: 0; z-index: 3000; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; padding: 24px; }
+.nt-preview-img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,0.6); }
+.nt-preview-close { position: fixed; top: 14px; right: 14px; color: #fff; background: rgba(255,255,255,0.14); }
+.nt-preview-open { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); color: #fff; font-size: 12px; background: rgba(255,255,255,0.16); padding: 6px 14px; border-radius: 999px; text-decoration: none; }
+.nt-preview-open:hover { background: rgba(255,255,255,0.28); }
 .nt-acts { display: flex; flex-direction: column; gap: 4px; flex: none; }
 
 @media (max-width: 899px) {
